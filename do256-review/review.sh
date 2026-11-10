@@ -6,10 +6,12 @@
 #     bash review.sh setup        # create the scenario (and break a few things)
 #     bash review.sh check        # grade all 8 tasks
 #     bash review.sh check 4      # grade one task
+#     bash review.sh watch        # live scoreboard, ticks tasks off as they are done
 #     bash review.sh hint 4       # show a hint for task 4
 #     bash review.sh solve 4      # apply the solution for task 4 (instructor)
 #     bash review.sh solve all    # apply every solution
 #     bash review.sh cleanup      # remove everything the review created
+#     bash review.sh reset        # cleanup + setup (start over)
 #
 #  Run it on the workstation, logged in as a cluster admin:
 #     oc login -u admin -p redhatocp https://api.ocp4.example.com:6443
@@ -160,9 +162,6 @@ EOF
 check1() {
   title "Task 1 · Ch1 · Who's on the staff?"
   local p=0
-  local idp; idp=$(oc get oauth cluster -o json 2>/dev/null | jget "d['spec']['identityProviders'][0]['name']" | tr 'A-Z' 'a-z')
-  if [ -n "$idp" ] && [ "$(answer idp)" = "$idp" ]; then ok "answer 'idp' matches the identity provider name"
-  else bad "answer key 'idp' in configmap pizza-answers is missing or wrong"; p=1; fi
   if [ "$(oc auth can-i create virtualmachines.kubevirt.io -n "$KITCHEN" --as "$STUDENT" 2>/dev/null)" = "yes" ]; then
     ok "$STUDENT can create VMs in $KITCHEN"
   else bad "$STUDENT cannot create VMs in $KITCHEN yet"; p=1; fi
@@ -189,7 +188,11 @@ check3() {
   if [ -z "$j" ]; then bad "VM oven1 not found in $KITCHEN"; return 1; fi
   local p=0
   [ "$(echo "$j" | jget "d['spec']['instancetype']['name']")" = "pizza-small" ] && ok "uses instance type pizza-small" || { bad "VM does not use instance type pizza-small"; p=1; }
-  [ "$(echo "$j" | jget "d['spec']['template']['metadata']['labels']['app']")" = "oven" ] && ok "VM template has label app=oven" || { bad "VM template needs label app=oven (task 4 and 8 depend on it)"; p=1; }
+  local vl tl; vl=$(echo "$j" | jget "d['metadata']['labels']['app']"); tl=$(echo "$j" | jget "d['spec']['template']['metadata']['labels']['app']")
+  if [ "$vl" = "oven" ] || [ "$tl" = "oven" ]; then ok "VM has label app=oven"
+  else bad "VM needs label app=oven (tasks 4 and 8 depend on it)"; p=1; fi
+  if [ "$vl" = "oven" ] && [ "$tl" != "oven" ]; then warn "tip: also add app=oven under spec.template.metadata.labels so the VM pod gets it"; fi
+  if [ "$tl" = "oven" ] && [ "$vl" != "oven" ]; then warn "tip: also add app=oven under metadata.labels so the backup in task 8 finds the VM"; fi
   local phase; phase=$(oc get vmi oven1 -n "$KITCHEN" -o jsonpath='{.status.phase}' 2>/dev/null)
   if [ "$phase" = "Running" ]; then ok "oven1 is Running 🔥"
   else bad "oven1 is not Running yet (phase: ${phase:-none}) — check: oc get dv,vmi -n $KITCHEN"; p=1; fi
@@ -210,7 +213,7 @@ for p in d.get('items',[]):
         frm=r.get('from',[]) or []
         nsok=any((f.get('namespaceSelector',{}).get('matchLabels',{}).get('pizza-role')=='customers' or
                   f.get('namespaceSelector',{}).get('matchLabels',{}).get('kubernetes.io/metadata.name')=='$FRONT')
-                 and 'podSelector' not in f for f in frm)
+                 and not f.get('podSelector',{}).get('matchLabels') and not f.get('podSelector',{}).get('matchExpressions') for f in frm)
         if '8080' in ports and nsok: good=True
 print('yes' if good else 'no')")
   local p=0
@@ -287,27 +290,32 @@ do_check() {
 # ==============================================================================
 do_hint() {
   case "${1:-}" in
-    1) say "${Y}Hint 1:${N} oc get oauth cluster -o yaml → spec.identityProviders[].name
-        oc create cm pizza-answers ... or: oc set data cm/pizza-answers -n $KITCHEN idp=<name>
-        Role: oc adm policy add-role-to-user kubevirt.io:edit $STUDENT -n $KITCHEN";;
-    2) say "${Y}Hint 2:${N} kind: VirtualMachineInstancetype (apiVersion instancetype.kubevirt.io/v1beta1)
-        spec.cpu.guest: 1   spec.memory.guest: 2Gi";;
-    3) say "${Y}Hint 3:${N} oc get cm pizza-menu -n $KITCHEN -o yaml  → which DataSource to clone
-        VM: spec.instancetype {kind: VirtualMachineInstancetype, name: pizza-small},
-        spec.preference.inferFromVolume, a dataVolumeTemplate with sourceRef kind: DataSource,
-        template label app: oven, runStrategy: Always";;
-    4) say "${Y}Hint 4:${N} Don't delete deny-all — policies ADD up. New policy:
-        podSelector app=oven · ingress from namespaceSelector pizza-role=customers · port TCP 8080";;
-    5) say "${Y}Hint 5:${N} oc describe userdefinednetwork delivery-lane -n $DELIVERY
-        The label k8s.ovn.org/primary-user-defined-network must be on the namespace WHEN IT IS CREATED.
-        Delete the project, re-create it with the label, then re-create the UDN.";;
-    6) say "${Y}Hint 6:${N} oc edit net-attach-def pizza-bridge -n $KITCHEN
-        Spelling! br-piza → br-pizza, in the config AND the resourceName annotation.";;
-    7) say "${Y}Hint 7:${N} oc get provider -n openshift-mtv   (type openshift)
-        Which MTV migration copies data while the VM keeps running? Which TCP port does iSCSI use?
-        oc set data cm/pizza-answers -n $KITCHEN mtv-provider=... migration=... iscsi-port=...";;
-    8) say "${Y}Hint 8:${N} Backup in $ADP: includedNamespaces [$KITCHEN], labelSelector app=oven, snapshotMoveData: true
-        Wait for Completed → oc delete vm oven1 -n $KITCHEN → Restore with backupName: oven-backup";;
+    1) say "${Y}Hint 1:${N} Console: User Management › RoleBindings › Create binding
+        Namespace role binding · namespace $KITCHEN · role kubevirt.io:edit · subject User $STUDENT
+        CLI: oc adm policy add-role-to-user kubevirt.io:edit $STUDENT -n $KITCHEN";;
+    2) say "${Y}Hint 2:${N} Console: Virtualization › InstanceTypes › User InstanceTypes › Create (project $KITCHEN)
+        kind VirtualMachineInstancetype · spec.cpu.guest: 1 · spec.memory.guest: 2Gi
+        CLI: oc apply -f <yaml> ; oc get virtualmachineinstancetype -n $KITCHEN";;
+    3) say "${Y}Hint 3:${N} Menu: Workloads › ConfigMaps › pizza-menu  → which boot volume to use
+        Console: Virtualization › Catalog › InstanceTypes › boot volume › User provided › pizza-small › name oven1
+        Customize VirtualMachine › YAML: add app: oven under metadata.labels AND spec.template.metadata.labels
+        CLI: VM with spec.instancetype {kind: VirtualMachineInstancetype, name: pizza-small} + DataSource dataVolumeTemplate";;
+    4) say "${Y}Hint 4:${N} Don't delete deny-all — policies ADD up.
+        Console: Networking › NetworkPolicies › Create NetworkPolicy · pod selector app=oven
+        · ingress › allow pods from inside the cluster › namespace selector pizza-role=customers · port TCP 8080";;
+    5) say "${Y}Hint 5:${N} Console: Networking › UserDefinedNetworks › delivery-lane › Conditions
+        The label k8s.ovn.org/primary-user-defined-network must be on the project WHEN IT IS CREATED.
+        Delete project $DELIVERY › re-create it with the label (+ Import YAML) › re-create the UDN.";;
+    6) say "${Y}Hint 6:${N} Console: Networking › NetworkAttachmentDefinitions › pizza-bridge › YAML
+        Spelling! br-piza → br-pizza, in spec.config AND the resourceName annotation.
+        CLI: oc edit net-attach-def pizza-bridge -n $KITCHEN";;
+    7) say "${Y}Hint 7:${N} Console: Migration › Providers for virtualization (type OpenShift Virtualization)
+        Workloads › ConfigMaps › pizza-answers › Actions › Edit ConfigMap › Add key/value
+        Which migration copies data while the VM keeps running? Which TCP port does iSCSI use?
+        CLI: oc set data cm/pizza-answers -n $KITCHEN mtv-provider=... migration=... iscsi-port=...";;
+    8) say "${Y}Hint 8:${N} Console: Operators › Installed Operators › OADP (project $ADP) › Backup tab › Create Backup
+        includedNamespaces [$KITCHEN] · labelSelector app=oven · snapshotMoveData: true
+        Wait for Completed › delete oven1 › Restore tab › Create Restore with backupName: oven-backup";;
     *) say "Usage: bash review.sh hint <1-8>";;
   esac
 }
@@ -316,11 +324,8 @@ do_hint() {
 # SOLUTIONS
 # ==============================================================================
 solve1() {
-  local idp; idp=$(oc get oauth cluster -o jsonpath='{.spec.identityProviders[0].name}')
-  oc get cm pizza-answers -n "$KITCHEN" >/dev/null 2>&1 || oc create cm pizza-answers -n "$KITCHEN" >/dev/null
-  oc set data cm/pizza-answers -n "$KITCHEN" idp="$idp" >/dev/null
   oc adm policy add-role-to-user kubevirt.io:edit "$STUDENT" -n "$KITCHEN" >/dev/null
-  info "idp=$idp · $STUDENT got kubevirt.io:edit in $KITCHEN"
+  info "$STUDENT got kubevirt.io:edit in $KITCHEN"
 }
 solve2() {
   oc apply -f - <<EOF
@@ -498,13 +503,62 @@ do_solve() {
 do_cleanup() {
   need_admin
   title "🧹  Closing Pizza Planet ..."
-  oc delete restore.velero.io oven-restore -n "$ADP" --ignore-not-found >/dev/null 2>&1
-  if command -v velero >/dev/null 2>&1; then velero backup delete oven-backup --confirm >/dev/null 2>&1
+  oc delete restore.velero.io oven-restore -n "$ADP" --ignore-not-found >/dev/null 2>&1 && info "restore oven-restore removed"
+  if command -v velero >/dev/null 2>&1; then velero backup delete oven-backup -n "$ADP" --confirm >/dev/null 2>&1
   else oc delete backup.velero.io oven-backup -n "$ADP" --ignore-not-found >/dev/null 2>&1; fi
+  info "backup oven-backup removed"
+  # stop and delete VMs first so the projects are not held up by running VMs
+  oc delete vm --all -n "$KITCHEN" --ignore-not-found --wait=false >/dev/null 2>&1
   for ns in "$KITCHEN" "$FRONT" "$DELIVERY"; do
     oc delete ns "$ns" --ignore-not-found --wait=false >/dev/null 2>&1 && info "deleting project $ns"
   done
-  say "${G}Done.${N}"
+  printf '   %s•%s waiting for the projects to disappear ' "$C" "$N"
+  local i left
+  for i in $(seq 1 60); do
+    left=0
+    for ns in "$KITCHEN" "$FRONT" "$DELIVERY"; do oc get ns "$ns" >/dev/null 2>&1 && left=$((left+1)); done
+    [ "$left" -eq 0 ] && break
+    printf '.'; sleep 5
+  done
+  say ""
+  if [ "$left" -eq 0 ]; then say "${G}${W}Clean. Run  bash review.sh setup  to start again.${N}"
+  else warn "$left project(s) still terminating — check: oc get ns | grep pizza"; fi
+}
+
+# ==============================================================================
+# WATCH — live scoreboard that ticks tasks off as students finish them
+# ==============================================================================
+do_watch() {
+  need_admin
+  local every=${1:-10}
+  trap 'tput cnorm 2>/dev/null; say ""; exit 0' INT TERM
+  tput civis 2>/dev/null
+  local t out pass board slices
+  declare -A done_at=()
+  while true; do
+    pass=0; board=""
+    for t in 1 2 3 4 5 6 7 8; do
+      if out=$("check$t" 2>/dev/null); then
+        pass=$((pass+1))
+        [ -z "${done_at[$t]:-}" ] && done_at[$t]=$(date +%H:%M)
+        board+="$(printf '%s' "$out" | sed -n '/Task /{p;q}')  ${G}✔ DONE${N} ${D}at ${done_at[$t]}${N}"$'\n'
+      else
+        unset "done_at[$t]"
+        board+="$(printf '%s' "$out" | sed '/^$/d' | sed "1s/\$/  ${Y}⏳ pending${N}/")"$'\n'
+      fi
+    done
+    slices=""; for t in $(seq 1 8); do if [ "$t" -le "$pass" ]; then slices+="🍕"; else slices+="⬜"; fi; done
+    clear
+    say "${W}${M}🍕  PIZZA PLANET · LIVE SCOREBOARD${N}   ${D}$(date +%H:%M:%S) · refreshes every ${every}s · Ctrl+C to stop${N}"
+    printf '%s' "$board"
+    say ""
+    say "${W}Score: $pass / 8${N}   $slices"
+    if [ "$pass" -eq 8 ]; then
+      say "${G}${W}🎉  Pizza Planet is fully virtual! Post 'PIZZA DELIVERED 8/8' in the chat.${N}"
+      tput cnorm 2>/dev/null; return 0
+    fi
+    sleep "$every"
+  done
 }
 
 # ==============================================================================
@@ -522,12 +576,16 @@ case "$cmd" in
   check)   do_check "$@";;
   hint)    do_hint "$@";;
   solve)   do_solve "$@";;
+  watch)   do_watch "$@";;
   cleanup) do_cleanup;;
+  reset)   do_cleanup; do_setup;;
   *) banner; say "
 Usage:
   bash review.sh setup          create the scenario
   bash review.sh check [N]      grade all tasks, or task N
+  bash review.sh watch [secs]   live scoreboard: ticks tasks off as you finish them
   bash review.sh hint N         show a hint
   bash review.sh solve N|all    apply a solution (instructor)
-  bash review.sh cleanup        remove everything";;
+  bash review.sh cleanup        remove everything
+  bash review.sh reset          cleanup, then setup again";;
 esac
