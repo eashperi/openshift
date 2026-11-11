@@ -162,12 +162,14 @@ EOF
 check1() {
   title "Task 1 · Ch1 · Who's on the staff?"
   local p=0
-  if [ "$(oc auth can-i create virtualmachines.kubevirt.io -n "$KITCHEN" --as "$STUDENT" 2>/dev/null)" = "yes" ]; then
+  # use the exit code (--quiet), not the text: some clusters print "no - <reason>" or a warning line
+  if oc auth can-i create virtualmachines.kubevirt.io -n "$KITCHEN" --as "$STUDENT" --quiet >/dev/null 2>&1; then
     ok "$STUDENT can create VMs in $KITCHEN"
   else bad "$STUDENT cannot create VMs in $KITCHEN yet"; p=1; fi
-  if [ "$(oc auth can-i delete namespace "$KITCHEN" --as "$STUDENT" 2>/dev/null)" = "no" ]; then
+  if ! oc auth can-i delete namespace "$KITCHEN" --as "$STUDENT" --quiet >/dev/null 2>&1 && \
+     ! oc auth can-i delete projects.project.openshift.io "$KITCHEN" --as "$STUDENT" --quiet >/dev/null 2>&1; then
     ok "...but cannot delete the project (least privilege)"
-  else bad "$STUDENT has too much power — use kubevirt.io:edit, not admin"; p=1; fi
+  else bad "$STUDENT can delete the project — use the role kubevirt.io:edit, not admin (check: oc get rolebinding -n $KITCHEN)"; p=1; fi
   return $p
 }
 
